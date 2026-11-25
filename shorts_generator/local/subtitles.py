@@ -4,8 +4,10 @@ Generates Advanced SubStation Alpha (.ass) subtitles with karaoke-style
 active word pop and high-contrast styling for YouTube Shorts and TikTok.
 """
 
+import io
 import os
-from typing import List, Dict, Any
+import subprocess
+from typing import Any, Dict, List, Optional
 from faster_whisper import WhisperModel
 
 
@@ -42,6 +44,54 @@ def sanitize_dialogue(text: str) -> str:
     return clean.strip().upper()
 
 
+def extract_word_timings_slice(
+    media_path: str,
+    start_time: float,
+    end_time: float,
+    model_size: str = "base.en",
+) -> List[Dict[str, Any]]:
+    """Extract word timestamps from an audio slice using faster-whisper.
+
+    Args:
+        media_path: Local media path.
+        start_time: Start timestamp in seconds.
+        end_time: End timestamp in seconds.
+        model_size: Faster-whisper model identifier.
+
+    Returns:
+        List of dictionaries with sanitized word, start timestamp, and end timestamp relative to start_time.
+    """
+    duration = max(0.5, end_time - start_time)
+    cmd = [
+        "ffmpeg", "-v", "error",
+        "-ss", f"{start_time:.3f}",
+        "-t", f"{duration:.3f}",
+        "-i", media_path,
+        "-vn", "-ac", "1", "-ar", "16000",
+        "-f", "wav", "-"
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    audio_stream = io.BytesIO(res.stdout)
+
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    segments, _ = model.transcribe(audio_stream, word_timestamps=True, beam_size=5)
+
+    words: List[Dict[str, Any]] = []
+    for segment in segments:
+        if not segment.words:
+            continue
+        for item in segment.words:
+            w_text = sanitize_dialogue(item.word)
+            if not w_text:
+                continue
+            words.append({
+                "word": w_text,
+                "start": max(0.0, item.start),
+                "end": max(item.start + 0.05, item.end)
+            })
+    return words
+
+
 def extract_word_timings(media_path: str, model_size: str = "base.en") -> List[Dict[str, Any]]:
     """Transcribe media to retrieve word-level boundaries and probabilities.
 
@@ -71,7 +121,11 @@ def extract_word_timings(media_path: str, model_size: str = "base.en") -> List[D
     return words
 
 
-def group_into_chunks(words: List[Dict[str, Any]], max_words: int = 3, max_gap_sec: float = 0.45) -> List[List[Dict[str, Any]]]:
+def group_into_chunks(
+    words: List[Dict[str, Any]],
+    max_words: int = 3,
+    max_gap_sec: float = 0.45,
+) -> List[List[Dict[str, Any]]]:
     """Group words into short conversational chunks for fast-paced mobile viewing.
 
     Args:
@@ -129,8 +183,8 @@ def build_ass_script(
         inactive_color: ASS color code for surrounding chunk words.
         outline_color: ASS color code for text stroke outline.
         outline_width: Pixel width of the stroke outline.
-        target_w: Target canvas width in pixels (1080 or 2160).
-        target_h: Target canvas height in pixels (1920 or 3840).
+        target_w: Target canvas width in pixels.
+        target_h: Target canvas height in pixels.
 
     Returns:
         Full UTF-8 ASS file content string.
@@ -190,8 +244,11 @@ def generate_ass_file(
     margin_v: int = 520,
     target_w: int = 1080,
     target_h: int = 1920,
+    words: Optional[List[Dict[str, Any]]] = None,
+    clip_start: float = 0.0,
+    clip_end: Optional[float] = None,
 ) -> str:
-    """Generate and write an ASS subtitle file from input media.
+    """Generate and write an ASS subtitle file from input media or cached words.
 
     Args:
         input_media: Path to video or audio source.
@@ -199,12 +256,37 @@ def generate_ass_file(
         margin_v: Vertical margin from bottom edge.
         target_w: Canvas target width in pixels.
         target_h: Canvas target height in pixels.
+        words: Optional pre-extracted word timing dictionaries.
+        clip_start: Start timestamp of the clip in seconds for relative offset.
+        clip_end: End timestamp of the clip in seconds.
 
     Returns:
         Absolute path to the created ASS file.
     """
-    words = extract_word_timings(input_media)
-    chunks = group_into_chunks(words)
+    if words is not None:
+        clip_words: List[Dict[str, Any]] = []
+        for w in words:
+            w_start = float(w.get("start", 0.0))
+            w_end = float(w.get("end", 0.0))
+            if clip_end is not None and w_start > clip_end:
+                continue
+            if w_end < clip_start:
+                continue
+            rel_start = max(0.0, w_start - clip_start)
+            rel_end = max(rel_start + 0.05, w_end - clip_start)
+            w_text = sanitize_dialogue(str(w.get("word", "")))
+            if w_text:
+                clip_words.append({
+                    "word": w_text,
+                    "start": rel_start,
+                    "end": rel_end,
+                })
+        selected_words = clip_words
+    else:
+        actual_end = clip_end if clip_end is not None else (clip_start + 60.0)
+        selected_words = extract_word_timings_slice(input_media, clip_start, actual_end)
+
+    chunks = group_into_chunks(selected_words)
     content = build_ass_script(chunks, margin_v=margin_v, target_w=target_w, target_h=target_h)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_ass)), exist_ok=True)

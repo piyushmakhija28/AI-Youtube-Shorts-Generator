@@ -2,17 +2,20 @@
 
 Features:
 - Dual-engine encoding: Auto-detects Intel Arc Quick Sync Video (h264_qsv)
-  with Direct3D11 hardware acceleration, falling back to multi-threaded libx264.
+  with Direct3D11 hardware acceleration, falling back gracefully to multi-threaded libx264.
 - Broadcast audio mastering: EBU R128 loudness normalization (-14 LUFS, -1.5 dBFS True Peak),
   highpass rumble cut (80 Hz), and vocal presence boost (3.2 kHz).
-- Studio reframing modes: split_stack, left_focus, right_focus, smart_focus, center.
+- Studio reframing modes: split_stack, left_focus, right_focus, smart_focus, center, fit_blur, zoom_blur.
+- Dynamic aspect ratios: 9:16 (vertical), 1:1 (square), 4:5 (portrait), 16:9 (landscape).
 - Mobile streaming optimization: BT.709 broadcast colorimetry and moov atom faststart.
 """
 
+import io
 import os
 import subprocess
-from typing import Dict, List, Optional, Tuple
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from PIL import Image
 
 from ..config import LOCAL_OUTPUT_DIR, RAW_CAPTIONS_DIR
 from ..clip_registry import ClipRegistry
@@ -92,6 +95,56 @@ def get_source_dimensions(media_path: str) -> Tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
+def get_target_canvas_dimensions(aspect_ratio: str = "9:16", resolution: str = "4k") -> Tuple[int, int]:
+    """Compute target render canvas dimensions for requested aspect ratio and resolution profile.
+
+    Args:
+        aspect_ratio: Target aspect ratio ('9:16', '1:1', '4:5', '16:9').
+        resolution: Target resolution profile ('4k' or '1080p').
+
+    Returns:
+        Tuple of (width, height) in pixels.
+    """
+    is_4k = (resolution or "4k").lower() == "4k"
+    norm_ratio = (aspect_ratio or "9:16").strip()
+
+    if norm_ratio == "1:1":
+        dim = 2160 if is_4k else 1080
+        return dim, dim
+    if norm_ratio == "4:5":
+        return (1728, 2160) if is_4k else (864, 1080)
+    if norm_ratio == "16:9":
+        return (3840, 2160) if is_4k else (1920, 1080)
+
+    return (2160, 3840) if is_4k else (1080, 1920)
+
+
+def extract_representative_keyframe(source_path: str, timestamp: float) -> Optional[Image.Image]:
+    """Extract a single video frame as a PIL Image at specified timestamp.
+
+    Args:
+        source_path: Local media path.
+        timestamp: Presentation timestamp in seconds.
+
+    Returns:
+        PIL Image instance or None if extraction fails.
+    """
+    cmd = [
+        "ffmpeg", "-v", "error",
+        "-ss", f"{max(0.0, timestamp):.3f}",
+        "-i", source_path,
+        "-vframes", "1",
+        "-f", "image2pipe",
+        "-vcodec", "png",
+        "-"
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        return Image.open(io.BytesIO(res.stdout)).convert("RGB")
+    except Exception:
+        return None
+
+
 def build_ffmpeg_filtergraph(
     src_w: int,
     src_h: int,
@@ -99,6 +152,7 @@ def build_ffmpeg_filtergraph(
     ass_path: Optional[str] = None,
     pixel_format: str = "format=nv12",
     resolution: str = "4k",
+    aspect_ratio: str = "9:16",
     framing_params: Optional[Dict] = None,
 ) -> str:
     """Construct FFmpeg video filtergraph with framing, separator, zoom, and subtitle burn-in.
@@ -110,6 +164,7 @@ def build_ffmpeg_filtergraph(
         ass_path: Optional path to ASS subtitle file to overlay.
         pixel_format: Pixel format filter string for encoder compatibility.
         resolution: Target resolution profile ('4k' for 2160x3840 or '1080p' for 1080x1920).
+        aspect_ratio: Target aspect ratio ('9:16', '1:1', '4:5', '16:9').
         framing_params: Optional dictionary of fine-tuned spatial coordinates, ratios, and dynamic zoom plans.
 
     Returns:
@@ -121,21 +176,22 @@ def build_ffmpeg_filtergraph(
         escaped_ass = f",ass='{norm_path}'"
 
     is_4k = (resolution or "4k").lower() == "4k"
-    out_w = 2160 if is_4k else 1080
-    out_h = 3840 if is_4k else 1920
+    out_w, out_h = get_target_canvas_dimensions(aspect_ratio=aspect_ratio, resolution=resolution)
 
-    crop_w_9_16 = int(src_h * (out_w / out_h))
-    crop_w_9_16 = max(2, crop_w_9_16 - (crop_w_9_16 % 2))
+    target_ratio = out_w / out_h
+    crop_w = int(src_h * target_ratio)
+    crop_w = min(src_w, max(2, crop_w - (crop_w % 2)))
 
     zoom_plan = framing_params.get("zoom_plan", None) if framing_params else None
     focal_x = framing_params.get("focal_x", 0.5) if framing_params else 0.5
     focal_y = framing_params.get("focal_y", 0.45) if framing_params else 0.45
 
     if framing == "split_stack":
+        half_h = out_h // 2
         sub_ratio = framing_params.get("sub_h_ratio", 0.72) if framing_params else 0.72
         sub_h = int(src_h * sub_ratio)
-        sub_w = int(sub_h * (out_w / (out_h // 2)))
-        sub_w = max(2, sub_w - (sub_w % 2))
+        sub_w = int(sub_h * (out_w / half_h))
+        sub_w = min(src_w, max(2, sub_w - (sub_w % 2)))
         sub_h = max(2, sub_h - (sub_h % 2))
 
         def_x_left = max(0, int(src_w * 0.08))
@@ -147,7 +203,6 @@ def build_ffmpeg_filtergraph(
         y_top = framing_params.get("y_top", def_y) if framing_params else def_y
         y_bot = framing_params.get("y_bot", def_y) if framing_params else def_y
 
-        half_h = out_h // 2
         line_y = half_h - 1
         line_thick = 4 if is_4k else 2
 
@@ -178,12 +233,12 @@ def build_ffmpeg_filtergraph(
     if framing == "zoom_blur":
         box_blur = "50:10" if is_4k else "25:5"
         fg_crop_w = int(src_w * 0.625)
-        fg_crop_h = int(fg_crop_w * (9 / 16))
+        fg_crop_h = int(fg_crop_w * (1.0 / target_ratio))
         fg_crop_w = max(2, fg_crop_w - (fg_crop_w % 2))
         fg_crop_h = max(2, fg_crop_h - (fg_crop_h % 2))
         fg_crop_x = int(src_w * 0.208)
         fg_crop_y = int(src_h * 0.138)
-        fg_h = int(out_w * (9 / 16))
+        fg_h = int(out_w * (1.0 / target_ratio))
         fg_h = max(2, fg_h - (fg_h % 2))
 
         filtergraph = (
@@ -195,13 +250,13 @@ def build_ffmpeg_filtergraph(
         return filtergraph
 
     if framing == "left_focus":
-        x_pos = max(0, int(src_w * 0.18))
-        crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w_9_16, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
+        x_pos = max(0, min(src_w - crop_w, int(src_w * 0.18)))
+        crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
         return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
 
     if framing == "right_focus":
-        x_pos = min(src_w - crop_w_9_16, int(src_w * 0.48))
-        crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w_9_16, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
+        x_pos = max(0, min(src_w - crop_w, int(src_w * 0.48)))
+        crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
         return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
 
     if framing == "smart_focus":
@@ -209,20 +264,20 @@ def build_ffmpeg_filtergraph(
         if strip_letterbox:
             active_h = framing_params.get("active_h", int(src_h * 0.88)) if framing_params else int(src_h * 0.88)
             active_h = max(2, active_h - (active_h % 2))
-            crop_w = int(active_h * (out_w / out_h))
-            crop_w = max(2, crop_w - (crop_w % 2))
+            active_crop_w = int(active_h * target_ratio)
+            active_crop_w = min(src_w, max(2, active_crop_w - (active_crop_w % 2)))
             y_offset = framing_params.get("y_offset", (src_h - active_h) // 2) if framing_params else (src_h - active_h) // 2
             x_ratio = framing_params.get("x_ratio", 0.30) if framing_params else 0.30
-            x_pos = max(0, min(src_w - crop_w, int(src_w * x_ratio)))
-            crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w, active_h, x_pos, y_offset, zoom_plan, focal_x, focal_y)
+            x_pos = max(0, min(src_w - active_crop_w, int(src_w * x_ratio)))
+            crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(active_crop_w, active_h, x_pos, y_offset, zoom_plan, focal_x, focal_y)
             return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
         x_ratio = framing_params.get("x_ratio", 0.28) if framing_params else 0.28
-        x_pos = max(0, min(src_w - crop_w_9_16, int(src_w * x_ratio)))
-        crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w_9_16, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
+        x_pos = max(0, min(src_w - crop_w, int(src_w * x_ratio)))
+        crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
         return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
 
-    x_pos = (src_w - crop_w_9_16) // 2
-    crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w_9_16, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
+    x_pos = (src_w - crop_w) // 2
+    crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
     return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
 
 
@@ -236,9 +291,11 @@ def render_short_clip(
     master_audio: bool = True,
     encoder_choice: str = "auto",
     resolution: str = "4k",
+    aspect_ratio: str = "9:16",
     framing_params: Optional[Dict] = None,
+    words: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Render a mobile vertical Short with hardware acceleration and broadcast audio.
+    """Render a mobile short video with hardware acceleration and broadcast audio.
 
     Args:
         source_path: Local media file path.
@@ -250,7 +307,9 @@ def render_short_clip(
         master_audio: Whether to apply EBU R128 loudness normalization and EQ.
         encoder_choice: Encoder selection ('auto', 'qsv', 'cpu').
         resolution: Output resolution profile ('4k' for 2160x3840 or '1080p' for 1080x1920).
+        aspect_ratio: Target aspect ratio ('9:16', '1:1', '4:5', '16:9').
         framing_params: Optional dictionary of fine-tuned spatial coordinates and ratios.
+        words: Optional pre-extracted word timing dictionaries for subtitle generation.
 
     Returns:
         Path to rendered .mp4 file.
@@ -259,8 +318,7 @@ def render_short_clip(
     src_w, src_h = get_source_dimensions(source_path)
 
     is_4k = (resolution or "4k").lower() == "4k"
-    target_w = 2160 if is_4k else 1080
-    target_h = 3840 if is_4k else 1920
+    target_w, target_h = get_target_canvas_dimensions(aspect_ratio=aspect_ratio, resolution=resolution)
 
     encoder, extra_enc_args, pix_fmt = get_encoder_config(encoder_choice, resolution=resolution)
 
@@ -270,7 +328,16 @@ def render_short_clip(
         ass_path = os.path.join(RAW_CAPTIONS_DIR, f"{stem}_captions.ass")
         default_margin_v = 940 if framing == "split_stack" else 520
         margin_v = framing_params.get("margin_v", default_margin_v) if framing_params else default_margin_v
-        generate_ass_file(source_path, ass_path, margin_v=margin_v, target_w=target_w, target_h=target_h)
+        generate_ass_file(
+            input_media=source_path,
+            output_ass=ass_path,
+            margin_v=margin_v,
+            target_w=target_w,
+            target_h=target_h,
+            words=words,
+            clip_start=start_time,
+            clip_end=end_time,
+        )
 
     filtergraph = build_ffmpeg_filtergraph(
         src_w, src_h,
@@ -278,6 +345,7 @@ def render_short_clip(
         ass_path=ass_path,
         pixel_format=pix_fmt,
         resolution=resolution,
+        aspect_ratio=aspect_ratio,
         framing_params=framing_params,
     )
 
@@ -328,7 +396,80 @@ def render_short_clip(
         out_path
     ])
 
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as err:
+        if encoder == "h264_qsv":
+            print(f"[clip/local] WARNING: Hardware encoder h264_qsv failed ({err}). Falling back to libx264 software encoder.", flush=True)
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+
+            sw_filtergraph = build_ffmpeg_filtergraph(
+                src_w, src_h,
+                framing=framing,
+                ass_path=ass_path,
+                pixel_format="format=yuv420p",
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+                framing_params=framing_params,
+            )
+
+            if is_4k:
+                sw_flags = ["-preset", "medium", "-crf", "16", "-b:v", "30M", "-maxrate", "45M", "-bufsize", "60M", "-threads", "0"]
+            else:
+                sw_flags = ["-preset", "slow", "-crf", "17", "-b:v", "15M", "-maxrate", "25M", "-bufsize", "30M", "-threads", "0"]
+
+            sw_cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", f"{start_time:.3f}",
+                "-t", f"{duration:.3f}",
+                "-i", source_path
+            ]
+            if framing in ["split_stack", "fit_blur", "zoom_blur"]:
+                sw_cmd.extend([
+                    "-filter_complex", sw_filtergraph,
+                    "-map", "[v_out]",
+                    "-map", "0:a"
+                ])
+            else:
+                sw_cmd.extend([
+                    "-vf", sw_filtergraph
+                ])
+
+            if master_audio:
+                fade_out_st = max(0.0, duration - 0.03)
+                af_chain = (
+                    f"afade=t=in:ss=0:d=0.02,afade=t=out:st={fade_out_st:.3f}:d=0.03,"
+                    "highpass=f=80,equalizer=f=3200:t=q:w=1.5:g=3.0,loudnorm=I=-14:LRA=11:TP=-1.5,aresample=48000"
+                )
+                sw_cmd.extend([
+                    "-af", af_chain,
+                    "-c:a", "aac",
+                    "-b:a", "192k"
+                ])
+            else:
+                sw_cmd.extend([
+                    "-c:a", "aac",
+                    "-b:a", "192k"
+                ])
+
+            sw_cmd.extend([
+                "-c:v", "libx264",
+                *sw_flags,
+                "-colorspace", "bt709",
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-color_range", "tv",
+                "-movflags", "+faststart",
+                out_path
+            ])
+            subprocess.run(sw_cmd, check=True)
+        else:
+            raise
+
     return out_path
 
 
@@ -343,9 +484,30 @@ def crop_highlights_local(
     video_id: Optional[str] = None,
     resolution: str = "4k",
     transcript_segments: Optional[List[Dict]] = None,
+    transcript_words: Optional[List[Dict]] = None,
     auto_framing: bool = True,
     auto_zoom: bool = True,
 ) -> List[Dict]:
+    """Render highlighted segments into standalone social video clips.
+
+    Args:
+        source_path: Local media file path.
+        highlights: List of highlight dictionaries with timing boundaries.
+        aspect_ratio: Target aspect ratio ('9:16', '1:1', '4:5', '16:9').
+        framing: Framing mode string.
+        burn_subtitles: Subtitle overlay toggle.
+        master_audio: Audio normalization and EQ toggle.
+        out_dir: Destination directory path.
+        video_id: Persistent identifier override.
+        resolution: Target resolution profile ('4k' or '1080p').
+        transcript_segments: Full list of transcript segment dictionaries.
+        transcript_words: Full list of pre-extracted word timing dictionaries.
+        auto_framing: Intelligent framing recommendation toggle.
+        auto_zoom: Dynamic zoom plan toggle.
+
+    Returns:
+        List of processed highlight dictionaries with output file paths.
+    """
     out_dir = os.path.abspath(os.path.expanduser(out_dir or LOCAL_OUTPUT_DIR))
     os.makedirs(out_dir, exist_ok=True)
     results: List[Dict] = []
@@ -376,10 +538,13 @@ def crop_highlights_local(
         )
 
         if auto_framing and framing_analyzer and (clip_framing in ("auto", None) or not clip_framing_params):
+            sample_time = candidate.snapped_start + (candidate.snapped_end - candidate.snapped_start) * 0.25
+            keyframe = extract_representative_keyframe(source_path, sample_time)
             rec = framing_analyzer.recommend_framing(
                 highlight=candidate,
                 transcript_segments=transcript_segments,
                 source_dimensions=src_dims,
+                keyframe=keyframe,
             )
             if clip_framing in ("auto", None):
                 clip_framing = rec.mode
@@ -403,7 +568,9 @@ def crop_highlights_local(
                 burn_subtitles=burn_subtitles,
                 master_audio=master_audio,
                 resolution=resolution,
+                aspect_ratio=aspect_ratio,
                 framing_params=clip_framing_params,
+                words=transcript_words,
             )
             registry.register_clip(
                 video_id=vid,

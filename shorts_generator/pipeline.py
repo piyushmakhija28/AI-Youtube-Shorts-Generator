@@ -59,6 +59,7 @@ def _run_local(
         video_id: Optional video identifier for persistent exclusion.
         guard_band: Minimum temporal separation between clips in seconds.
         resolution: Output resolution profile ('4k' for 2160x3840 or '1080p' for 1080x1920).
+        auto_zoom: Whether dynamic zoom plans should be applied.
 
     Returns:
         Structured pipeline result dictionary.
@@ -101,6 +102,7 @@ def _run_local(
         video_id=vid,
         resolution=resolution,
         transcript_segments=transcript.get("segments"),
+        transcript_words=transcript.get("words"),
         auto_framing=(framing in ("auto", "smart", "split_stack")),
         auto_zoom=auto_zoom,
     )
@@ -122,39 +124,52 @@ def _run_api(
     download_format: str,
     language: Optional[str],
 ) -> Dict:
-    """Execute pipeline via remote MuAPI cloud endpoints.
+    """Execute processing via external MuAPI cloud services.
 
     Args:
-        youtube_url: YouTube video URL.
-        num_clips: Target count of shorts.
-        aspect_ratio: Aspect ratio specification.
-        download_format: Target format string.
+        youtube_url: Hosted media URL.
+        num_clips: Number of top highlights to generate.
+        aspect_ratio: Target aspect ratio string.
+        download_format: Target format identifier.
         language: Language code hint.
 
     Returns:
-        Structured result dictionary.
+        Structured pipeline output dictionary.
     """
-    source_url = download_youtube(youtube_url, fmt=download_format)
-
-    transcript = transcribe(source_url, language=language)
+    require_api_key()
+    download_url = download_youtube(youtube_url, download_format)
+    transcript = transcribe(download_url, language=language)
     if not transcript["segments"]:
         raise RuntimeError(
-            "Whisper produced no segments. The video may have no detectable speech."
+            "Whisper produced no segments. The video may have no detectable speech, "
+            "or the download URL may be inaccessible."
         )
 
-    highlights_result = get_highlights(transcript, num_clips=num_clips, llm_fn=call_muapi_llm)
+    vid = _extract_video_id(youtube_url)
+    highlights_result = get_highlights(
+        transcript,
+        num_clips=num_clips,
+        llm_fn=call_muapi_llm,
+        video_id=vid
+    )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
         raise RuntimeError("Highlight generator returned zero clips.")
 
     top = sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True)[:num_clips]
-    print(f"[pipeline] cropping {len(top)} of {len(all_highlights)} candidates", flush=True)
+    print(f"[pipeline/api] cropping top {len(top)} of {len(all_highlights)} candidates", flush=True)
 
-    shorts = crop_highlights(source_url, top, aspect_ratio=aspect_ratio)
+    shorts = crop_highlights(
+        download_url,
+        top,
+        aspect_ratio=aspect_ratio,
+        video_id=vid
+    )
 
     return {
         "mode": "api",
-        "source_video_url": source_url,
+        "video_id": vid,
+        "source_video_url": download_url,
         "transcript": transcript,
         "highlights": all_highlights,
         "shorts": shorts,
@@ -163,67 +178,76 @@ def _run_api(
 
 def generate_shorts(
     youtube_url: str,
-    num_clips: int = 3,
+    num_clips: int = 5,
     aspect_ratio: str = "9:16",
-    download_format: str = "2160",
-    language: Optional[str] = None,
     mode: str = "local",
+    download_format: str = "best",
+    language: Optional[str] = None,
     framing: str = "split_stack",
     burn_subtitles: bool = True,
     master_audio: bool = True,
-    video_id: Optional[str] = None,
     guard_band: float = 45.0,
+    video_id: Optional[str] = None,
     resolution: str = "4k",
     auto_zoom: bool = True,
-    timeout: Optional[float] = None,
+    timeout: Optional[int] = None,
 ) -> Dict:
-    """Execute end-to-end shorts generation workflow.
+    """Entry point for shorts generation pipeline with timeout safeguard.
 
     Args:
-        youtube_url: Source YouTube URL or local file path.
-        num_clips: Number of candidate shorts to produce.
-        aspect_ratio: Aspect ratio ('9:16', '1:1').
-        download_format: Ingest resolution ('720', '1080', '2160', '4k').
-        language: Language hint code.
-        mode: Execution backend ('local' or 'api').
-        framing: Layout framing strategy.
-        burn_subtitles: Whether to burn dynamic karaoke subtitles.
-        master_audio: Whether to apply broadcast loudness normalization.
-        video_id: Optional video identifier for persistent exclusion.
-        guard_band: Minimum temporal separation between clips in seconds.
-        resolution: Output resolution profile ('4k' for 2160x3840 or '1080p' for 1080x1920).
+        youtube_url: YouTube URL string or local file path.
+        num_clips: Number of highlights to return.
+        aspect_ratio: Target aspect ratio ('9:16', '1:1', '4:5', '16:9').
+        mode: Processing mode ('local' or 'api').
+        download_format: Shorthand quality selector.
+        language: Language code hint.
+        framing: Framing strategy.
+        burn_subtitles: Subtitle overlay toggle.
+        master_audio: EBU R128 audio mastering toggle.
+        guard_band: Temporal distance guard in seconds.
+        video_id: Persistent identifier override.
+        resolution: Output profile ('4k' or '1080p').
+        auto_zoom: Dynamic zoom plan toggle.
+        timeout: Execution timeout in seconds.
 
     Returns:
-        Dictionary containing transcript, ranked highlights, and rendered shorts metadata.
+        Structured output dictionary with shorts metadata.
     """
-    mode = (mode or "local").lower()
+    if mode == "api":
+        return _run_api(youtube_url, num_clips, aspect_ratio, download_format, language)
+
     if mode == "local":
-        provider = (LLM_PROVIDER or "openai").strip().lower()
-        if provider in ("arc_runner", "intel_arc", "arc"):
+        if LLM_PROVIDER in ("arc_runner", "intel_arc", "arc"):
             pass
-        elif provider == "openai":
-            require_openai_key()
-        elif provider == "gemini":
+        elif LLM_PROVIDER == "gemini":
             require_gemini_key()
         else:
-            raise RuntimeError(
-                f"Unknown LLM_PROVIDER={provider!r}. Use 'arc_runner', 'openai', or 'gemini'."
+            require_openai_key()
+
+        def _execute():
+            return _run_local(
+                youtube_url=youtube_url,
+                num_clips=num_clips,
+                aspect_ratio=aspect_ratio,
+                download_format=download_format,
+                language=language,
+                framing=framing,
+                burn_subtitles=burn_subtitles,
+                master_audio=master_audio,
+                video_id=video_id,
+                guard_band=guard_band,
+                resolution=resolution,
+                auto_zoom=auto_zoom,
             )
-        return _run_local(
-            youtube_url,
-            num_clips,
-            aspect_ratio,
-            download_format,
-            language,
-            framing=framing,
-            burn_subtitles=burn_subtitles,
-            master_audio=master_audio,
-            video_id=video_id,
-            guard_band=guard_band,
-            resolution=resolution,
-            auto_zoom=auto_zoom,
-        )
-    if mode == "api":
-        require_api_key()
-        return _run_api(youtube_url, num_clips, aspect_ratio, download_format, language)
-    raise ValueError(f"Unknown mode: {mode!r}. Use 'api' or 'local'.")
+
+        if timeout and timeout > 0:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_execute)
+                try:
+                    return future.result(timeout=float(timeout))
+                except concurrent.futures.TimeoutError:
+                    raise TimeoutError(f"Pipeline execution exceeded timeout of {timeout}s.")
+        return _execute()
+
+    raise ValueError(f"Unknown mode: {mode!r}. Must be 'local' or 'api'.")
