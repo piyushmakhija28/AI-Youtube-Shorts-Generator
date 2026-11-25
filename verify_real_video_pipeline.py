@@ -19,7 +19,9 @@ from typing import Any, Dict, List
 from PIL import Image
 
 from shorts_generator.diversity_types import CandidateHighlight, HighlightArchetype
-from shorts_generator.framing_analyzer import FramingAnalyzer
+from shorts_generator.engine.self_healing import CorruptedVideoError, SelfHealingVideoSanitizer
+from shorts_generator.face_tracker import FaceTracker
+from shorts_generator.framing_analyzer import FramingAnalyzer, generate_pan_crop_expression, smooth_speaker_tracking
 from shorts_generator.local.clipper import (
     extract_representative_keyframe,
     get_source_dimensions,
@@ -28,6 +30,7 @@ from shorts_generator.local.clipper import (
 )
 from shorts_generator.local.subtitles import generate_ass_file
 from shorts_generator.local.transcriber import sanitize_transcript_segments
+from shorts_generator.video.color_matrix_fixer import ColorMatrixFixer
 
 
 def probe_media_file(file_path: str) -> Dict[str, Any]:
@@ -220,8 +223,60 @@ def run_real_video_verification() -> int:
     print(f"PASS: 4:5 rendered in {dur_4x5:.1f}s -> {meta_4x5['width']}x{meta_4x5['height']} ({meta_4x5['size_bytes'] / 1024 / 1024:.2f} MB)")
     assert meta_4x5["width"] == 864 and meta_4x5["height"] == 1080
 
+    print("\n--- [TEST 7: Color Matrix Probing & BT.709 Tagging (Issue #496)] ---")
+    color_meta = ColorMatrixFixer.probe_color_metadata(raw_video)
+    print(f"[Color] Probed color metadata: {color_meta}")
+    assert isinstance(color_meta, dict)
+    assert "color_space" in color_meta
+    cm_filter = ColorMatrixFixer.build_color_matrix_filter(color_meta)
+    print(f"[Color] Matrix conversion filter required: {cm_filter is not None} (Filter: {cm_filter})")
+    out_tags = ColorMatrixFixer.get_output_tagging_flags()
+    assert out_tags["-colorspace"] == "bt709"
+    print("PASS: Color matrix probe and broadcast tagging verified")
+
+    print("\n--- [TEST 8: Container Health Inspection & Self-Healing DLQ (Issue #586)] ---")
+    is_healthy, err_msg = SelfHealingVideoSanitizer.inspect_container(raw_video)
+    assert is_healthy is True, f"Real video container reported unhealthy: {err_msg}"
+    print(f"PASS: Real source video container verified healthy via ffprobe inspection")
+
+    test_corrupt_file = os.path.join(out_dir, "simulated_corrupt.mp4")
+    with open(test_corrupt_file, "wb") as f:
+        f.write(b"CORRUPT_MOOV_ATOM_TEST_BYTES_NON_CONTAINER")
+
+    quarantined = SelfHealingVideoSanitizer.route_to_dlq(
+        media_path=test_corrupt_file,
+        reason="Corrupt header simulated in verification suite",
+        dlq_dir=os.path.join(out_dir, "dlq")
+    )
+    assert os.path.exists(quarantined), "DLQ file quarantine failed"
+    report_path = os.path.join(out_dir, "dlq", "simulated_corrupt_failure_report.json")
+    assert os.path.exists(report_path), "DLQ failure report JSON missing"
+    print(f"PASS: Corrupted asset safely quarantined to DLQ: {Path(quarantined).name}")
+
+    print("\n--- [TEST 9: CV Face Detection & Dynamic Panning Expression (Issue #3)] ---")
+    tracker = FaceTracker()
+    detected_faces = tracker.sample_video_faces(
+        media_path=raw_video,
+        start_time=0.0,
+        end_time=5.0,
+        fps_sample=2.0
+    )
+    print(f"[FaceTracker] Sampled 5s window: {len(detected_faces)} face events detected")
+    mock_exchange = [
+        {"timestamp": 0.0, "center_x": 420.0, "speaker_id": 0},
+        {"timestamp": 1.5, "center_x": 420.0, "speaker_id": 0},
+        {"timestamp": 3.0, "center_x": 1400.0, "speaker_id": 1},
+        {"timestamp": 4.5, "center_x": 1400.0, "speaker_id": 1},
+    ]
+    smoothed_exchange = smooth_speaker_tracking(mock_exchange, frame_width=src_w, hold_seconds=2.5)
+    pan_expression = generate_pan_crop_expression(smoothed_exchange, crop_w=1080, src_w=src_w)
+    print(f"[PanExpression] Generated expression: {pan_expression}")
+    assert "if(lte(t," in pan_expression
+    assert "min(max(" in pan_expression
+    print("PASS: Dynamic pan expression and face tracking pipeline verified")
+
     print("\n" + "=" * 78)
-    print("ALL REAL VIDEO VERIFICATION TESTS PASSED SUCCESSFULLY!")
+    print("ALL 9 REAL VIDEO VERIFICATION TESTS PASSED SUCCESSFULLY!")
     print("=" * 78)
     return 0
 

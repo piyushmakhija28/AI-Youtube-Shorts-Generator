@@ -20,7 +20,10 @@ from PIL import Image
 from ..config import LOCAL_OUTPUT_DIR, RAW_CAPTIONS_DIR
 from ..clip_registry import ClipRegistry
 from ..diversity_types import CandidateHighlight, FramingMode, HighlightArchetype, ZoomPlan
-from ..framing_analyzer import FramingAnalyzer
+from ..engine.self_healing import CorruptedVideoError, SelfHealingVideoSanitizer
+from ..face_tracker import FaceTracker
+from ..framing_analyzer import FramingAnalyzer, generate_pan_crop_expression, smooth_speaker_tracking
+from ..video.color_matrix_fixer import ColorMatrixFixer
 from ..viral_zoom_analyzer import ViralZoomAnalyzer
 from .subtitles import generate_ass_file
 
@@ -186,6 +189,9 @@ def build_ffmpeg_filtergraph(
     focal_x = framing_params.get("focal_x", 0.5) if framing_params else 0.5
     focal_y = framing_params.get("focal_y", 0.45) if framing_params else 0.45
 
+    color_matrix_filter = framing_params.get("color_matrix_filter", None) if framing_params else None
+    cm_prefix = f"{color_matrix_filter}," if color_matrix_filter else ""
+
     if framing == "split_stack":
         half_h = out_h // 2
         sub_ratio = framing_params.get("sub_h_ratio", 0.72) if framing_params else 0.72
@@ -212,22 +218,40 @@ def build_ffmpeg_filtergraph(
         crop_top = ViralZoomAnalyzer.build_crop_filter_with_zoom(sub_w, sub_h, x_top, y_top, zoom_plan_top, focal_x, focal_y)
         crop_bot = ViralZoomAnalyzer.build_crop_filter_with_zoom(sub_w, sub_h, x_bot, y_bot, zoom_plan_bot, focal_x, focal_y)
 
-        filtergraph = (
-            f"[0:v]{crop_top},scale={out_w}:{half_h}:flags=lanczos[top]; "
-            f"[0:v]{crop_bot},scale={out_w}:{half_h}:flags=lanczos[bot]; "
-            f"[top][bot]vstack=inputs=2,drawbox=y={line_y}:w={out_w}:h={line_thick}:color=black@0.9:t=fill"
-            f"{escaped_ass},{pixel_format}[v_out]"
-        )
+        if color_matrix_filter:
+            filtergraph = (
+                f"[0:v]{color_matrix_filter},split=2[v_top_in][v_bot_in]; "
+                f"[v_top_in]{crop_top},scale={out_w}:{half_h}:flags=lanczos[top]; "
+                f"[v_bot_in]{crop_bot},scale={out_w}:{half_h}:flags=lanczos[bot]; "
+                f"[top][bot]vstack=inputs=2,drawbox=y={line_y}:w={out_w}:h={line_thick}:color=black@0.9:t=fill"
+                f"{escaped_ass},{pixel_format}[v_out]"
+            )
+        else:
+            filtergraph = (
+                f"[0:v]{crop_top},scale={out_w}:{half_h}:flags=lanczos[top]; "
+                f"[0:v]{crop_bot},scale={out_w}:{half_h}:flags=lanczos[bot]; "
+                f"[top][bot]vstack=inputs=2,drawbox=y={line_y}:w={out_w}:h={line_thick}:color=black@0.9:t=fill"
+                f"{escaped_ass},{pixel_format}[v_out]"
+            )
         return filtergraph
 
     if framing == "fit_blur":
         box_blur = "50:10" if is_4k else "25:5"
-        filtergraph = (
-            f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},boxblur={box_blur},eq=brightness=-0.30[bg]; "
-            f"[0:v]scale={out_w}:-1:flags=lanczos[fg]; "
-            f"[bg][fg]overlay=0:(H-h)/2"
-            f"{escaped_ass},{pixel_format}[v_out]"
-        )
+        if color_matrix_filter:
+            filtergraph = (
+                f"[0:v]{color_matrix_filter},split=2[v_fb_bg][v_fb_fg]; "
+                f"[v_fb_bg]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},boxblur={box_blur},eq=brightness=-0.30[bg]; "
+                f"[v_fb_fg]scale={out_w}:-1:flags=lanczos[fg]; "
+                f"[bg][fg]overlay=0:(H-h)/2"
+                f"{escaped_ass},{pixel_format}[v_out]"
+            )
+        else:
+            filtergraph = (
+                f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},boxblur={box_blur},eq=brightness=-0.30[bg]; "
+                f"[0:v]scale={out_w}:-1:flags=lanczos[fg]; "
+                f"[bg][fg]overlay=0:(H-h)/2"
+                f"{escaped_ass},{pixel_format}[v_out]"
+            )
         return filtergraph
 
     if framing == "zoom_blur":
@@ -241,25 +265,35 @@ def build_ffmpeg_filtergraph(
         fg_h = int(out_w * (1.0 / target_ratio))
         fg_h = max(2, fg_h - (fg_h % 2))
 
-        filtergraph = (
-            f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},boxblur={box_blur},eq=brightness=-0.35[bg]; "
-            f"[0:v]crop={fg_crop_w}:{fg_crop_h}:{fg_crop_x}:{fg_crop_y},scale={out_w}:{fg_h}:flags=lanczos[fg]; "
-            f"[bg][fg]overlay=0:(H-h)/2"
-            f"{escaped_ass},{pixel_format}[v_out]"
-        )
+        if color_matrix_filter:
+            filtergraph = (
+                f"[0:v]{color_matrix_filter},split=2[v_zb_bg][v_zb_fg]; "
+                f"[v_zb_bg]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},boxblur={box_blur},eq=brightness=-0.35[bg]; "
+                f"[v_zb_fg]crop={fg_crop_w}:{fg_crop_h}:{fg_crop_x}:{fg_crop_y},scale={out_w}:{fg_h}:flags=lanczos[fg]; "
+                f"[bg][fg]overlay=0:(H-h)/2"
+                f"{escaped_ass},{pixel_format}[v_out]"
+            )
+        else:
+            filtergraph = (
+                f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},boxblur={box_blur},eq=brightness=-0.35[bg]; "
+                f"[0:v]crop={fg_crop_w}:{fg_crop_h}:{fg_crop_x}:{fg_crop_y},scale={out_w}:{fg_h}:flags=lanczos[fg]; "
+                f"[bg][fg]overlay=0:(H-h)/2"
+                f"{escaped_ass},{pixel_format}[v_out]"
+            )
         return filtergraph
 
     if framing == "left_focus":
         x_pos = max(0, min(src_w - crop_w, int(src_w * 0.18)))
         crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
-        return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
+        return f"{cm_prefix}{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
 
     if framing == "right_focus":
         x_pos = max(0, min(src_w - crop_w, int(src_w * 0.48)))
         crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
-        return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
+        return f"{cm_prefix}{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
 
     if framing == "smart_focus":
+        pan_expr = framing_params.get("pan_expr", None) if framing_params else None
         strip_letterbox = framing_params.get("strip_letterbox", False) if framing_params else False
         if strip_letterbox:
             active_h = framing_params.get("active_h", int(src_h * 0.88)) if framing_params else int(src_h * 0.88)
@@ -267,18 +301,24 @@ def build_ffmpeg_filtergraph(
             active_crop_w = int(active_h * target_ratio)
             active_crop_w = min(src_w, max(2, active_crop_w - (active_crop_w % 2)))
             y_offset = framing_params.get("y_offset", (src_h - active_h) // 2) if framing_params else (src_h - active_h) // 2
-            x_ratio = framing_params.get("x_ratio", 0.30) if framing_params else 0.30
-            x_pos = max(0, min(src_w - active_crop_w, int(src_w * x_ratio)))
-            crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(active_crop_w, active_h, x_pos, y_offset, zoom_plan, focal_x, focal_y)
-            return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
+            if pan_expr:
+                crop_filter = f"crop=w={active_crop_w}:h={active_h}:x='{pan_expr}':y={y_offset}:exact=1"
+            else:
+                x_ratio = framing_params.get("x_ratio", 0.30) if framing_params else 0.30
+                x_pos = max(0, min(src_w - active_crop_w, int(src_w * x_ratio)))
+                crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(active_crop_w, active_h, x_pos, y_offset, zoom_plan, focal_x, focal_y)
+            return f"{cm_prefix}{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
+        if pan_expr:
+            crop_filter = f"crop=w={crop_w}:h={src_h}:x='{pan_expr}':y=0:exact=1"
+            return f"{cm_prefix}{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
         x_ratio = framing_params.get("x_ratio", 0.28) if framing_params else 0.28
         x_pos = max(0, min(src_w - crop_w, int(src_w * x_ratio)))
         crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
-        return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
+        return f"{cm_prefix}{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
 
     x_pos = (src_w - crop_w) // 2
     crop_filter = ViralZoomAnalyzer.build_crop_filter_with_zoom(crop_w, src_h, x_pos, 0, zoom_plan, focal_x, focal_y)
-    return f"{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
+    return f"{cm_prefix}{crop_filter},scale={out_w}:{out_h}:flags=lanczos{escaped_ass},{pixel_format}"
 
 
 def render_short_clip(
@@ -315,7 +355,16 @@ def render_short_clip(
         Path to rendered .mp4 file.
     """
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    source_path = SelfHealingVideoSanitizer.ensure_playable_or_heal(source_path)
     src_w, src_h = get_source_dimensions(source_path)
+
+    if framing_params is None:
+        framing_params = {}
+    if "color_matrix_filter" not in framing_params:
+        cm_meta = ColorMatrixFixer.probe_color_metadata(source_path)
+        cm_filter = ColorMatrixFixer.build_color_matrix_filter(cm_meta)
+        if cm_filter:
+            framing_params["color_matrix_filter"] = cm_filter
 
     is_4k = (resolution or "4k").lower() == "4k"
     target_w, target_h = get_target_canvas_dimensions(aspect_ratio=aspect_ratio, resolution=resolution)
@@ -466,9 +515,48 @@ def render_short_clip(
                 "-movflags", "+faststart",
                 out_path
             ])
-            subprocess.run(sw_cmd, check=True)
+            try:
+                subprocess.run(sw_cmd, check=True)
+            except subprocess.CalledProcessError as sw_err:
+                repaired_ok, repaired_path = SelfHealingVideoSanitizer.repair_container(source_path)
+                if repaired_ok and repaired_path != source_path:
+                    print(f"[clip/local] Re-indexed corrupt container to {repaired_path}. Retrying render...", flush=True)
+                    return render_short_clip(
+                        source_path=repaired_path,
+                        start_time=start_time,
+                        end_time=end_time,
+                        out_path=out_path,
+                        framing=framing,
+                        burn_subtitles=burn_subtitles,
+                        master_audio=master_audio,
+                        encoder_choice="cpu",
+                        resolution=resolution,
+                        aspect_ratio=aspect_ratio,
+                        framing_params=framing_params,
+                        words=words,
+                    )
+                SelfHealingVideoSanitizer.route_to_dlq(source_path, reason=str(sw_err))
+                raise CorruptedVideoError(f"Rendering failed and container repair could not salvage asset: {sw_err}")
         else:
-            raise
+            repaired_ok, repaired_path = SelfHealingVideoSanitizer.repair_container(source_path)
+            if repaired_ok and repaired_path != source_path:
+                print(f"[clip/local] Re-indexed corrupt container to {repaired_path}. Retrying render...", flush=True)
+                return render_short_clip(
+                    source_path=repaired_path,
+                    start_time=start_time,
+                    end_time=end_time,
+                    out_path=out_path,
+                    framing=framing,
+                    burn_subtitles=burn_subtitles,
+                    master_audio=master_audio,
+                    encoder_choice="cpu",
+                    resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                    framing_params=framing_params,
+                    words=words,
+                )
+            SelfHealingVideoSanitizer.route_to_dlq(source_path, reason=str(err))
+            raise CorruptedVideoError(f"Rendering failed and container repair could not salvage asset: {err}")
 
     return out_path
 
@@ -555,6 +643,29 @@ def crop_highlights_local(
             if z_plan.events:
                 clip_framing_params["zoom_plan"] = z_plan
 
+        if auto_framing and (clip_framing in ("auto", "smart_focus") or clip_framing_params.get("active_face_tracking", False)):
+            try:
+                face_tracker = FaceTracker()
+                face_detections = face_tracker.sample_video_faces(
+                    media_path=source_path,
+                    start_time=candidate.snapped_start,
+                    end_time=candidate.snapped_end,
+                    fps_sample=2.0
+                )
+                if face_detections:
+                    smoothed = smooth_speaker_tracking(face_detections, frame_width=src_dims[0])
+                    t_w, t_h = get_target_canvas_dimensions(aspect_ratio=aspect_ratio, resolution=resolution)
+                    t_ratio = t_w / t_h
+                    c_w = int(src_dims[1] * t_ratio)
+                    c_w = min(src_dims[0], max(2, c_w - (c_w % 2)))
+                    pan_expr = generate_pan_crop_expression(smoothed, crop_w=c_w, src_w=src_dims[0])
+                    clip_framing_params["pan_expr"] = pan_expr
+                    clip_framing_params["smoothed_tracking"] = smoothed
+                    if clip_framing in ("auto", None):
+                        clip_framing = "smart_focus"
+            except Exception as e:
+                print(f"[clip/local] Face tracking notice: {e}", flush=True)
+
         seq = registry.get_next_sequence_number(vid)
         out_path = os.path.join(out_dir, f"short_{vid}_{seq:03d}_{archetype_str}.mp4")
         print(f"[clip/local] Rendering {i}/{len(highlights)}: {h.get('title', '(untitled)')} [{clip_framing}] ({resolution}) -> {Path(out_path).name}", flush=True)
@@ -591,6 +702,11 @@ def crop_highlights_local(
             })
         except Exception as e:
             print(f"[clip/local] Error on clip {i}: {e}", flush=True)
-            results.append({**h, "clip_url": None, "error": str(e)})
+            results.append({
+                **h,
+                "clip_url": None,
+                "error": str(e),
+                "dlq_path": getattr(e, "dlq_path", None),
+            })
 
     return results

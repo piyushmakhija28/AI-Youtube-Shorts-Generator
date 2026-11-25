@@ -344,3 +344,70 @@ def smooth_speaker_tracking(
         })
 
     return smoothed
+
+
+def generate_pan_crop_expression(
+    smoothed_detections: List[Dict],
+    crop_w: int,
+    src_w: int,
+    default_x: Optional[int] = None,
+) -> str:
+    """Compile smoothed speaker tracking coordinates into an FFmpeg mathematical pan expression x(t).
+
+    Calculates target crop X coordinates centering on smoothed speaker detections,
+    interpolating linearly between timestamp transitions and clamping within [0, src_w - crop_w].
+
+    Args:
+        smoothed_detections: List of smoothed detection dictionaries containing 'timestamp' and 'smoothed_x'.
+        crop_w: Active crop width in pixels.
+        src_w: Source video width in pixels.
+        default_x: Optional stationary fallback X coordinate in pixels.
+
+    Returns:
+        FFmpeg mathematical time expression string representing horizontal crop coordinate x(t).
+    """
+    max_x = max(0, src_w - crop_w)
+    fallback_x = default_x if default_x is not None else max_x // 2
+    fallback_x = max(0, min(max_x, fallback_x))
+
+    if not smoothed_detections:
+        return str(fallback_x)
+
+    keypoints: List[Tuple[float, int]] = []
+    for item in smoothed_detections:
+        t = float(item.get("timestamp", 0.0))
+        cx = float(item.get("smoothed_x", src_w * 0.5))
+        target_crop_x = int(round(cx - (crop_w / 2.0)))
+        clamped_x = max(0, min(max_x, target_crop_x))
+
+        if not keypoints:
+            keypoints.append((t, clamped_x))
+        else:
+            prev_t, prev_x = keypoints[-1]
+            if abs(clamped_x - prev_x) >= 4 or (t - prev_t) >= 2.0:
+                keypoints.append((t, clamped_x))
+
+    if not keypoints:
+        return str(fallback_x)
+
+    if len(keypoints) == 1:
+        return str(keypoints[0][1])
+
+    all_same = all(kp[1] == keypoints[0][1] for kp in keypoints)
+    if all_same:
+        return str(keypoints[0][1])
+
+    expr = str(keypoints[-1][1])
+    for i in range(len(keypoints) - 2, -1, -1):
+        t0, x0 = keypoints[i]
+        t1, x1 = keypoints[i + 1]
+        dt = max(0.001, t1 - t0)
+        dx = x1 - x0
+        segment_interp = f"({x0}+({dx:.2f})*(t-{t0:.3f})/{dt:.3f})"
+        expr = f"if(lte(t,{t1:.3f}),{segment_interp},{expr})"
+
+    t_first = keypoints[0][0]
+    x_first = keypoints[0][1]
+    expr = f"if(lte(t,{t_first:.3f}),{x_first},{expr})"
+    return f"min(max({expr},0),{max_x})"
+
