@@ -171,20 +171,22 @@ def build_ass_script(
     outline_width: int = 7,
     target_w: int = 1080,
     target_h: int = 1920,
+    metrics: Optional[List[Any]] = None,
 ) -> str:
-    """Build complete ASS document with active-word karaoke styling.
+    """Build complete ASS document with active-word karaoke styling and prosody kinetic animation.
 
     Args:
         chunks: List of word chunks.
         margin_v: Vertical margin from bottom edge in reference coordinates.
         font_name: Font face name.
         font_size: Point size of the subtitle text in 1080x1920 reference.
-        active_color: ASS color code for currently spoken word.
+        active_color: ASS color code for currently spoken word when metric not specified.
         inactive_color: ASS color code for surrounding chunk words.
         outline_color: ASS color code for text stroke outline.
         outline_width: Pixel width of the stroke outline.
         target_w: Target canvas width in pixels.
         target_h: Target canvas height in pixels.
+        metrics: Optional list of ProsodyWordMetric instances matching words.
 
     Returns:
         Full UTF-8 ASS file content string.
@@ -194,6 +196,11 @@ def build_ass_script(
     effective_outline = max(1, int(round(outline_width * scale)))
     effective_margin_v = int(round(margin_v * scale))
     effective_margin_lr = int(round(60 * scale))
+
+    metric_map: Dict[Tuple[float, str], Any] = {}
+    if metrics:
+        for m in metrics:
+            metric_map[(round(getattr(m, "start", 0.0), 2), getattr(m, "word", ""))] = m
 
     header = (
         "[Script Info]\n"
@@ -228,7 +235,13 @@ def build_ass_script(
             for j, token in enumerate(chunk):
                 w = token["word"]
                 if j == i:
-                    tokens.append(f"{{\\c{active_color}&\\fscx115\\fscy115}}{w}{{\\c{inactive_color}&\\fscx100\\fscy100}}")
+                    m = metric_map.get((round(token["start"], 2), w))
+                    if m is not None:
+                        act_c = getattr(m, "active_color", active_color)
+                        k_tags = getattr(m, "kinetic_tags", "\\fscx115\\fscy115")
+                        tokens.append(f"{{\\c{act_c}&{k_tags}}}{w}{{\\c{inactive_color}&\\fscx100\\fscy100}}")
+                    else:
+                        tokens.append(f"{{\\c{active_color}&\\fscx115\\fscy115}}{w}{{\\c{inactive_color}&\\fscx100\\fscy100}}")
                 else:
                     tokens.append(w)
 
@@ -247,6 +260,9 @@ def generate_ass_file(
     words: Optional[List[Dict[str, Any]]] = None,
     clip_start: float = 0.0,
     clip_end: Optional[float] = None,
+    audio_path: Optional[str] = None,
+    enable_prosody: bool = True,
+    prosody_config: Optional[Any] = None,
 ) -> str:
     """Generate and write an ASS subtitle file from input media or cached words.
 
@@ -259,10 +275,14 @@ def generate_ass_file(
         words: Optional pre-extracted word timing dictionaries.
         clip_start: Start timestamp of the clip in seconds for relative offset.
         clip_end: End timestamp of the clip in seconds.
+        audio_path: Optional path to dedicated audio media file for prosody extraction.
+        enable_prosody: Whether to enable acoustic prosody-driven kinetic styling.
+        prosody_config: Optional KineticStyleConfig instance.
 
     Returns:
         Absolute path to the created ASS file.
     """
+    actual_end = clip_end if clip_end is not None else (clip_start + 60.0)
     if words is not None:
         clip_words: List[Dict[str, Any]] = []
         for w in words:
@@ -283,11 +303,32 @@ def generate_ass_file(
                 })
         selected_words = clip_words
     else:
-        actual_end = clip_end if clip_end is not None else (clip_start + 60.0)
         selected_words = extract_word_timings_slice(input_media, clip_start, actual_end)
 
+    metrics = None
+    if enable_prosody and selected_words:
+        try:
+            from ..video.prosody_typography import ProsodyKineticTypography
+            source_audio = audio_path if (audio_path and os.path.exists(audio_path)) else input_media
+            if os.path.exists(source_audio):
+                analyzer = ProsodyKineticTypography(config=prosody_config)
+                metrics = analyzer.analyze_clip_words(
+                    words=selected_words,
+                    media_path=source_audio,
+                    clip_start=clip_start,
+                    clip_end=actual_end,
+                )
+        except Exception:
+            metrics = None
+
     chunks = group_into_chunks(selected_words)
-    content = build_ass_script(chunks, margin_v=margin_v, target_w=target_w, target_h=target_h)
+    content = build_ass_script(
+        chunks,
+        margin_v=margin_v,
+        target_w=target_w,
+        target_h=target_h,
+        metrics=metrics,
+    )
 
     os.makedirs(os.path.dirname(os.path.abspath(output_ass)), exist_ok=True)
     with open(output_ass, "w", encoding="utf-8") as f:
