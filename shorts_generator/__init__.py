@@ -46,6 +46,23 @@ from .editorial import (
 )
 from .framing_analyzer import FramingAnalyzer, smooth_speaker_tracking
 from .pipeline import generate_shorts
+from .retention import (
+    AdaptiveScriptRewriter,
+    ConvergenceExhaustionError,
+    CuriosityAuditor,
+    CuriosityLoop,
+    DropOffScanner,
+    HazardCategory,
+    InvalidTranscriptError,
+    OptimizationResult,
+    OptimizationStatus,
+    OscillatoryRewriteError,
+    PacingHazardScorer,
+    RetentionHazard,
+    RetentionOptimizerError,
+    RetentionScorecard,
+    ViralScriptOptimizer,
+)
 from .viral_zoom_analyzer import ViralZoomAnalyzer
 
 __all__ = [
@@ -93,4 +110,19 @@ __all__ = [
     "SoundContext",
     "SoundEngineerAgent",
     "SwarmEditorialConsensus",
+    "AdaptiveScriptRewriter",
+    "ConvergenceExhaustionError",
+    "CuriosityAuditor",
+    "CuriosityLoop",
+    "DropOffScanner",
+    "HazardCategory",
+    "InvalidTranscriptError",
+    "OptimizationResult",
+    "OptimizationStatus",
+    "OscillatoryRewriteError",
+    "PacingHazardScorer",
+    "RetentionHazard",
+    "RetentionOptimizerError",
+    "RetentionScorecard",
+    "ViralScriptOptimizer",
 ]
