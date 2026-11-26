@@ -1,0 +1,57 @@
+"""Editorial consensus module for multi-agent swarm cut approval.
+
+Exports roles, contracts, specialist critique agents, Pareto arbitration logic,
+and the SwarmEditorialConsensus orchestrator.
+"""
+
+from .editorial_swarm import (
+    AgentBallot,
+    BaseEditorialAgent,
+    ConsensusDecision,
+    ConsensusFailureError,
+    ConsensusRoundRecord,
+    ConsensusStatus,
+    ContextProjector,
+    CritiqueDirective,
+    CutCandidate,
+    DirectorAgent,
+    DirectorContext,
+    EditorialRole,
+    EditorialSwarmError,
+    EditorialSwarmFactory,
+    EditorAgent,
+    EditorContext,
+    InvalidCandidateError,
+    OscillatoryDirectiveError,
+    ParetoArbitrator,
+    RemediationExhaustionError,
+    SoundContext,
+    SoundEngineerAgent,
+    SwarmEditorialConsensus,
+)
+
+__all__ = [
+    "AgentBallot",
+    "BaseEditorialAgent",
+    "ConsensusDecision",
+    "ConsensusFailureError",
+    "ConsensusRoundRecord",
+    "ConsensusStatus",
+    "ContextProjector",
+    "CritiqueDirective",
+    "CutCandidate",
+    "DirectorAgent",
+    "DirectorContext",
+    "EditorialRole",
+    "EditorialSwarmError",
+    "EditorialSwarmFactory",
+    "EditorAgent",
+    "EditorContext",
+    "InvalidCandidateError",
+    "OscillatoryDirectiveError",
+    "ParetoArbitrator",
+    "RemediationExhaustionError",
+    "SoundContext",
+    "SoundEngineerAgent",
+    "SwarmEditorialConsensus",
+]
