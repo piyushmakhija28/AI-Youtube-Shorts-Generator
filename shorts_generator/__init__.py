@@ -1,3 +1,16 @@
+from .audio import (
+    AudioMasteringError,
+    AudioStem,
+    BroadcastAudioMaster,
+    CodecEncodingError,
+    LoudnessComplianceError,
+    LoudnessMetrics,
+    LoudnessStandard,
+    MasteringConfig,
+    MasteringResult,
+    StemType,
+    StemValidationError,
+)
 from .diversity_types import (
     FramingMode,
     FramingRecommendation,
@@ -21,4 +34,15 @@ __all__ = [
     "ZoomEvent",
     "ZoomEventType",
     "ZoomPlan",
+    "AudioMasteringError",
+    "AudioStem",
+    "BroadcastAudioMaster",
+    "CodecEncodingError",
+    "LoudnessComplianceError",
+    "LoudnessMetrics",
+    "LoudnessStandard",
+    "MasteringConfig",
+    "MasteringResult",
+    "StemType",
+    "StemValidationError",
 ]

@@ -59,6 +59,15 @@ def get_raw_audio_dir() -> Path:
     return get_raw_dir() / "audio"
 
 
+def get_mastered_audio_dir() -> Path:
+    """Return the directory for broadcast-mastered audio stems and final mixes.
+
+    Returns:
+        Path pointing to output/raw/audio_mastered.
+    """
+    return get_raw_dir() / "audio_mastered"
+
+
 def get_raw_video_dir() -> Path:
     """Return the directory for raw video slices and benchmark clips.
 
@@ -80,13 +89,14 @@ def get_raw_captions_dir() -> Path:
 def ensure_output_dirs() -> None:
     """Ensure all required output and raw subdirectories exist on disk.
 
-    Creates output/, output/raw/images, output/raw/audio,
+    Creates output/, output/raw/images, output/raw/audio, output/raw/audio_mastered,
     output/raw/video, and output/raw/captions if they do not exist.
     """
     for d in (
         get_output_dir(),
         get_raw_images_dir(),
         get_raw_audio_dir(),
+        get_mastered_audio_dir(),
         get_raw_video_dir(),
         get_raw_captions_dir(),
     ):
@@ -117,6 +127,19 @@ def resolve_raw_audio_path(filename: Union[str, Path]) -> str:
     """
     ensure_output_dirs()
     return str(get_raw_audio_dir() / Path(filename).name)
+
+
+def resolve_mastered_audio_path(filename: Union[str, Path]) -> str:
+    """Resolve a mastered audio filename to an absolute path inside output/raw/audio_mastered.
+
+    Args:
+        filename: Base filename or relative path.
+
+    Returns:
+        Absolute filesystem path as a string.
+    """
+    ensure_output_dirs()
+    return str(get_mastered_audio_dir() / Path(filename).name)
 
 
 def resolve_raw_video_path(filename: Union[str, Path]) -> str:
